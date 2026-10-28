@@ -91,7 +91,9 @@ actor WebDAVClient {
         // Configure URL session
         let config = sessionConfiguration ?? URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 300
+        // The request timeout already bounds stalled transfers. A short total
+        // limit would fail every large file on a slow but healthy connection.
+        config.timeoutIntervalForResource = 7 * 24 * 60 * 60
         self.session = URLSession(configuration: config)
     }
 
@@ -318,10 +320,74 @@ actor WebDAVClient {
     /// Upload a file from a local URL
     /// - Parameter ifMatchEtag: If set, sends If-Match header for conflict detection (412 on mismatch)
     func uploadFile(from localURL: URL, to remotePath: String, ifMatchEtag: String? = nil, ifNoneMatch: Bool = false, progress: Progress? = nil, modificationDate: Date? = nil) async throws -> WebDAVItem? {
-        try await withRetry {
-            try await self.performUploadFile(from: localURL, to: remotePath, ifMatchEtag: ifMatchEtag, ifNoneMatch: ifNoneMatch, progress: progress, modificationDate: modificationDate)
+        guard ifMatchEtag != nil || ifNoneMatch else {
+            try await withRetry {
+                try await self.performUploadFile(from: localURL, to: remotePath, ifMatchEtag: nil, ifNoneMatch: false, progress: progress, modificationDate: modificationDate)
+            }
+            return try await listDirectory(path: remotePath).first
+        }
+
+        // A conditional PUT is not idempotent. The server may commit it after
+        // the reply is lost, and repeating it then fails its own precondition.
+        var interrupted = false
+        for attempt in 0...Self.maxRetries {
+            do {
+                try await performUploadFile(from: localURL, to: remotePath, ifMatchEtag: ifMatchEtag, ifNoneMatch: ifNoneMatch, progress: progress, modificationDate: modificationDate)
+                break
+            } catch WebDAVError.conflict where interrupted {
+                // An interrupted attempt may have committed while this one was sent.
+                if let remote = try await existingItem(at: remotePath),
+                   try await remoteContent(of: remote, matches: localURL) {
+                    return remote
+                }
+                throw WebDAVError.conflict
+            } catch {
+                guard attempt < Self.maxRetries, isTransientError(error) else { throw error }
+                interrupted = true
+                if let committed = try await resolveInterruptedUpload(from: localURL, to: remotePath, ifMatchEtag: ifMatchEtag) {
+                    return committed
+                }
+                let delay = Self.baseRetryDelay * pow(2.0, Double(attempt))
+                logger.warning("Upload interrupted (attempt \(attempt + 1)/\(Self.maxRetries + 1)): \(error.localizedDescription). Retrying in \(delay)s...")
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
         }
         return try await listDirectory(path: remotePath).first
+    }
+
+    /// Decide from the server state whether an interrupted conditional PUT
+    /// committed. Returns the stored item when it holds the uploaded bytes and
+    /// nil when the precondition still holds, so the upload may be repeated.
+    private func resolveInterruptedUpload(from localURL: URL, to remotePath: String, ifMatchEtag: String?) async throws -> WebDAVItem? {
+        guard let remote = try await existingItem(at: remotePath) else {
+            // A create may be repeated. An edited original that vanished is a conflict.
+            if ifMatchEtag == nil { return nil }
+            throw WebDAVError.conflict
+        }
+        if let etag = ifMatchEtag, Self.quotedETag(etag) == Self.quotedETag(remote.etag) { return nil }
+        if try await remoteContent(of: remote, matches: localURL) { return remote }
+        throw WebDAVError.conflict
+    }
+
+    private func existingItem(at remotePath: String) async throws -> WebDAVItem? {
+        do {
+            return try await listDirectory(path: remotePath).first
+        } catch WebDAVError.fileNotFound {
+            return nil
+        }
+    }
+
+    /// Compare bytes only when sizes agree. A different version is never accepted
+    /// as this upload, even if it shares the name.
+    private func remoteContent(of remote: WebDAVItem, matches localURL: URL) async throws -> Bool {
+        guard !remote.isDirectory,
+              Int64(try localURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) == remote.size,
+              let localHash = SHA256.hash(contentsOf: localURL) else { return false }
+        let comparison = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: comparison) }
+        try await downloadFile(remotePath: remote.remotePath, to: comparison,
+                               ifMatchEtag: remote.etag.isEmpty ? nil : remote.etag)
+        return SHA256.hash(contentsOf: comparison) == localHash
     }
 
     private func performUploadFile(from localURL: URL, to remotePath: String, ifMatchEtag: String?, ifNoneMatch: Bool, progress: Progress?, modificationDate: Date?) async throws {

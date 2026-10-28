@@ -4,10 +4,15 @@ import FileProvider
 private final class MockDAVProtocol: URLProtocol {
     static var requests: [URLRequest] = []
     static var handler: ((URLRequest) -> (Int, Data))!
+    static var failure: ((URLRequest) -> URLError?)?
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.requests.append(request)
+        if let error = Self.failure?(request) {
+            client?.urlProtocol(self, didFailWithError: error)
+            return
+        }
         let (status, data) = Self.handler(request)
         let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -190,6 +195,56 @@ private final class MockDAVProtocol: URLProtocol {
             check(MockDAVProtocol.requests.filter { $0.httpMethod == "PROPFIND" }.count == 2,
                   "retry only the metadata read after successful mutation")
         }
+
+        // The first PUT commits but its reply is lost. The client must recognize
+        // its own write rather than report a conflict with itself.
+        let uploadedSize = "<d:propstat><d:prop><d:getcontentlength>10</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
+        let interruptedPut: (URLRequest) -> URLError? = { request in
+            let puts = MockDAVProtocol.requests.filter { $0.httpMethod == "PUT" }.count
+            return request.httpMethod == "PUT" && puts == 1 ? URLError(.networkConnectionLost) : nil
+        }
+        for conditional in ["If-Match", "If-None-Match"] {
+            MockDAVProtocol.requests = []
+            MockDAVProtocol.failure = interruptedPut
+            MockDAVProtocol.handler = { request in
+                if request.httpMethod == "GET" { return (200, Data("local edit".utf8)) }
+                return (207, document(response("/remote.php/webdav/file.txt", etag: "&quot;version-2&quot;", extra: uploadedSize)))
+            }
+            let committed = conditional == "If-Match"
+                ? try await client.uploadFile(from: upload, to: "/file.txt", ifMatchEtag: "version-1")
+                : try await client.uploadFile(from: upload, to: "/file.txt", ifNoneMatch: true)
+            check(committed?.etag == "\"version-2\"", "\(conditional): interrupted upload that committed returns the stored item")
+            check(MockDAVProtocol.requests.filter { $0.httpMethod == "PUT" }.count == 1,
+                  "\(conditional): a committed upload is never repeated")
+        }
+
+        // The reply is lost before the server stored anything: repeat the upload.
+        MockDAVProtocol.requests = []
+        MockDAVProtocol.failure = interruptedPut
+        MockDAVProtocol.handler = { request in
+            if request.httpMethod == "PUT" { return (204, Data()) }
+            let puts = MockDAVProtocol.requests.filter { $0.httpMethod == "PUT" }.count
+            return (207, document(response("/remote.php/webdav/file.txt", etag: puts < 2 ? "&quot;version-1&quot;" : "&quot;version-2&quot;")))
+        }
+        let repeated = try await client.uploadFile(from: upload, to: "/file.txt", ifMatchEtag: "version-1")
+        check(repeated?.etag == "\"version-2\"", "uncommitted interrupted upload is repeated")
+        check(MockDAVProtocol.requests.filter { $0.httpMethod == "PUT" }.count == 2,
+              "repeat only after the server still holds the base version")
+
+        // Another client changed the file meanwhile: report a real conflict.
+        MockDAVProtocol.requests = []
+        MockDAVProtocol.failure = interruptedPut
+        MockDAVProtocol.handler = { request in
+            if request.httpMethod == "GET" { return (200, Data("other edit".utf8)) }
+            return (207, document(response("/remote.php/webdav/file.txt", etag: "&quot;version-3&quot;", extra: uploadedSize)))
+        }
+        do {
+            _ = try await client.uploadFile(from: upload, to: "/file.txt", ifMatchEtag: "version-1")
+            preconditionFailure("a different remote version must remain a conflict")
+        } catch WebDAVError.conflict { }
+        check(MockDAVProtocol.requests.filter { $0.httpMethod == "PUT" }.count == 1,
+              "never repeat an upload over another client's version")
+        MockDAVProtocol.failure = nil
 
         let movedResponse = document(response("/remote.php/webdav/renamed.txt", extra:
             "<d:propstat><d:prop><oc:id>stable-server-id</oc:id></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"))
